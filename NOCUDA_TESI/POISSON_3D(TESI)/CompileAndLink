@@ -1,0 +1,4 @@
+g++ -c Grid3D.cpp
+g++ -c MultiGrid3D.cpp
+g++ -c Poisson3DSolver.cpp
+g++ Grid3D.o MultiGrid3D.o Poisson3DSolver.o -o Poisson3D

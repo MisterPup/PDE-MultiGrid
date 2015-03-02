@@ -1,0 +1,463 @@
+#include "Grid2D.h"
+#include "MultiGrid2D.h"
+#include "inclusion.h"
+
+__global__ void CUDARestrict(float* fine, int fsize, int f_pitch, float* coarse, int csize, int c_pitch);
+__global__ void CUDAInterpolate(float* fine, int fsize, int f_pitch, float* coarse, int csize, int c_pitch);
+__global__ void CUDARelax(float* v, float* f, float h_x, float h_y, int size, int pitch, float x_a, float y_a, float* A, int alfa);  
+__global__ void CUDASet(float* v, int size, int pitch, float value, bool modifyBorder);
+__global__ void CUDACalculateResidual(float* v, float* f, float* residual, float h_x, float h_y, int size, int pitch, float x_a, float y_a, float* A, int alfa);
+__global__ void CUDAApplyCorrection(float* fine, float* error, int size, int pitch);
+
+MultiGrid2D::MultiGrid2D(int finestGridSize, float range[], float* _A, int A_sizeX, int alfa)
+{
+	InitGrids(finestGridSize, range);
+	InitA(_A, A_sizeX, alfa);
+}
+
+MultiGrid2D::~MultiGrid2D()
+{
+	for(int i = 0; i < numGrids; i++)
+	{
+		grids2D[i]->~Grid2D();
+	}
+	free(grids2D);
+}
+
+void MultiGrid2D::InitGrids(int finestGridSize, float range[])
+{
+	double tempNumGrids = finestGridSize - 1;
+	numGrids = log2(tempNumGrids); //finestGrid size = 65 = (2^6)+1 ---> numGrids = 6 (non creo griglie senza punti interni)
+
+	grids2D = (Grid2D**)malloc(numGrids*sizeof(Grid2D*));
+	grids2D[0] = new Grid2D(finestGridSize, range);
+	for(int i = 1; i < numGrids; i++)
+	{
+		int coarseGridSize = ((grids2D[i-1]->size-1)/2)+1; //coarseGridSize = ((2^/finerGridSize)-1)/2)+1
+		grids2D[i] = new Grid2D(coarseGridSize, range);
+	}
+}
+
+void MultiGrid2D::InitA(float* _A, int A_sizeX, int alfa) //_A deve essere una matrice linearizzata (quindi un array)
+{
+	this->alfa = alfa;
+	this->sizeX_A = A_sizeX; //dimensione lungo un solo asse (matrice sizeX_A*sizeX_A)
+
+	cudaMalloc(&d_matrixA, A_sizeX*A_sizeX*sizeof(float)); //usare cudaMallocPitch per una matrice 2x2 mi sembra inutile (con una lettura leggo entrambe le linee)
+	
+	cudaMemcpy(d_matrixA, _A, A_sizeX*A_sizeX*sizeof(float), cudaMemcpyHostToDevice);
+}
+
+void MultiGrid2D::Restrict(float* d_fine, int fsize, int f_pitch, float* d_coarse, int csize, int c_pitch)
+{
+	assert(csize == ((fsize-1)/2+1)); //controllo su dimensioni
+
+	dim3 threadsPerBlock(16, 16); //il massimo numero di thread attivi per blocco è 768, ma ogni blocco può avere al max 512 thread 	
+	int numBlocks_x = ceil((float)csize/threadsPerBlock.x);	//csize perchè in Restrict riempo una griglia più rada (quindi meno punti)
+	int numBlocks_y = ceil((float)csize/threadsPerBlock.y);
+	dim3 numBlocks(numBlocks_x, numBlocks_y);
+
+	CUDARestrict<<<numBlocks, threadsPerBlock>>>(d_fine, fsize, f_pitch, d_coarse, csize, c_pitch);	
+}
+
+void MultiGrid2D::Interpolate(float* d_fine, int fsize, int f_pitch, float* d_coarse, int csize, int c_pitch)
+{
+	assert(csize == ((fsize-1)/2+1)); //controllo su dimensioni
+
+	dim3 threadsPerBlock(16, 16); //il massimo numero di thread attivi per blocco è 768, ma ogni blocco può avere al max 512 thread 	
+	int numBlocks_x = ceil((float)fsize/threadsPerBlock.x);	//fsize perchè in Interpolate riempo una griglia più fine (quindi più punti)
+	int numBlocks_y = ceil((float)fsize/threadsPerBlock.y);
+	dim3 numBlocks(numBlocks_x, numBlocks_y);
+	
+	CUDAInterpolate<<<numBlocks, threadsPerBlock>>>(d_fine, fsize, f_pitch, d_coarse, csize, c_pitch);
+}
+
+void MultiGrid2D::Relax(Grid2D* curGrid, int ncycles)
+{
+	float* d_v = curGrid->d_v;
+	float* d_f = curGrid->d_f;
+	float h_x = curGrid->h_x;
+	float h_y = curGrid->h_y;
+	int size = curGrid->size;
+	int d_pitch = curGrid->d_pitch;
+	float x_a = curGrid->x_a;
+	float y_a = curGrid->y_a;
+
+	dim3 threadsPerBlock(16, 16); //il massimo numero di thread attivi per blocco è 768, ma ogni blocco può avere al max 512 thread 	
+	int numBlocks_x = ceil((float)size/threadsPerBlock.x);
+	int numBlocks_y = ceil((float)size/threadsPerBlock.y);
+	dim3 numBlocks(numBlocks_x, numBlocks_y);
+
+	for(int k = 0; k < ncycles; k++)                
+		CUDARelax<<<numBlocks, threadsPerBlock>>>(d_v, d_f, h_x, h_y, size, d_pitch, x_a, y_a, d_matrixA, alfa);
+}
+
+void MultiGrid2D::Set(float* v, int size, int pitch, float value, bool modifyBorder)
+{
+	dim3 threadsPerBlock(16, 16); //il massimo numero di thread attivi per blocco è 768, ma ogni blocco può avere al max 512 thread 	
+	int numBlocks_x = ceil((float)size/threadsPerBlock.x);
+	int numBlocks_y = ceil((float)size/threadsPerBlock.y);
+	dim3 numBlocks(numBlocks_x, numBlocks_y);
+
+	CUDASet<<<numBlocks, threadsPerBlock>>>(v, size, pitch, value, modifyBorder);
+}
+
+float* MultiGrid2D::CalculateResidual(Grid2D* curGrid)
+{
+	float* d_v = curGrid->d_v;
+	float* d_f = curGrid->d_f;
+	float h_x = curGrid->h_x;
+	float h_y = curGrid->h_y;
+	int size = curGrid->size;
+	int d_pitch = curGrid->d_pitch;
+	float x_a = curGrid->x_a;
+	float y_a = curGrid->y_a;
+
+	float* d_residual; //residuo (DEVICE)
+	size_t r_pitchByte; //sarà uguale a d_pitch perchè hanno la stessa dimensione
+	cudaMallocPitch(&d_residual, &r_pitchByte, size*sizeof(float), size);
+
+	dim3 threadsPerBlock(16, 16); //il massimo numero di thread attivi per blocco è 768, ma ogni blocco può avere al max 512 thread 	
+	int numBlocks_x = ceil((float)size/threadsPerBlock.x);
+	int numBlocks_y = ceil((float)size/threadsPerBlock.y);
+	dim3 numBlocks(numBlocks_x, numBlocks_y);
+							     
+	CUDACalculateResidual<<<numBlocks, threadsPerBlock>>>(d_v, d_f, d_residual, h_x, h_y, size, d_pitch, x_a, y_a, d_matrixA, alfa);
+	
+	return d_residual;
+}
+
+void MultiGrid2D::ApplyCorrection(float* fine, int fineSize, int f_pitch, float* error, int errorSize, int e_pitch)
+{
+	assert(fineSize == errorSize); //f_pitch == e_pitch
+	assert(f_pitch == e_pitch);	
+
+	dim3 threadsPerBlock(16, 16); //il massimo numero di thread attivi per blocco è 768, ma ogni blocco può avere al max 512 thread 	
+	int numBlocks_x = ceil((float)fineSize/threadsPerBlock.x);
+	int numBlocks_y = ceil((float)fineSize/threadsPerBlock.y);
+	dim3 numBlocks(numBlocks_x, numBlocks_y);
+
+	CUDAApplyCorrection<<<numBlocks, threadsPerBlock>>>(fine, error, fineSize, f_pitch);
+}
+
+void MultiGrid2D::VCycle(int gridID, int v1, int v2)
+{
+	Grid2D* fine = grids2D[gridID];
+	Relax(fine, v1);
+	if(gridID != numGrids - 1) //la griglia corrente non è la più rada
+	{
+		float* residual = CalculateResidual(fine);
+		int residualSize = fine->size;
+		int residualPitch = fine->d_pitch;
+		Grid2D* coarse = grids2D[gridID+1];
+		Restrict(residual, residualSize, residualPitch, coarse->d_f, coarse->size, coarse->d_pitch);	
+
+		//azzero tutto il vettore di errori (sui bordi sicuramente e=0)
+		Set(coarse->d_v, coarse->size, coarse->d_pitch, 0.0f, true);
+
+		VCycle(gridID+1, v1, v2);
+
+		int fsize = fine->size;
+		size_t error_pitchByte;
+		float* fine_error;  //errore sulla griglia fine
+		cudaMallocPitch(&fine_error, &error_pitchByte, fsize*sizeof(float), fsize);
+		int error_pitch = error_pitchByte/sizeof(float);
+		//coarse->v contiene errore su griglia rada
+		
+		Interpolate(fine_error, fsize, error_pitch, coarse->d_v, coarse->size, coarse->d_pitch); //porti l'errore da lvl kh a lvl (k-1)h, nullo lungo bordi
+		
+		ApplyCorrection(fine->d_v, fsize, fine->d_pitch, fine_error, fsize, error_pitch);
+	}
+
+	Relax(fine, v2);
+
+}
+
+void MultiGrid2D::FullMultiGridVCycle(int gridID, int v0, int v1, int v2)
+{
+	Grid2D* fine = grids2D[gridID];
+	if(gridID != numGrids - 1) //la griglia corrente non è la più rada
+	{
+		Grid2D* coarse = grids2D[gridID + 1];
+		Restrict(fine->d_f, fine->size, fine->d_pitch, coarse->d_f, coarse->size, coarse->d_pitch);
+		FullMultiGridVCycle(gridID + 1,v0, v1, v2);
+		Interpolate(fine->d_v, fine->size, fine->d_pitch, coarse->d_v, coarse->size, coarse->d_pitch);
+	}
+	else //i contorni non vanno modificati in quanto nel FMG lavoriamo sulla sol approx e non sull'errore	   
+		Set(fine->d_v, fine->size, fine->d_pitch, 0.0f, false);
+	
+	for(int i = 0; i < v0; i++)
+		VCycle(gridID, v1, v2);
+}
+
+void MultiGrid2D::PrintDiff()
+{
+	int diff_fd = open("log/diff.txt",O_RDWR|O_CREAT|O_TRUNC,S_IRWXU);
+	grids2D[0]->PrintDiffApproxReal(diff_fd);
+	close(diff_fd);
+}
+
+void MultiGrid2D::PrintGrid(int gridID)
+{
+	int logfd = open("log/log_v.txt",O_RDWR|O_CREAT|O_TRUNC,S_IRWXU);
+	grids2D[gridID]->PrintGrid_v(logfd);
+	close(logfd);
+}
+
+void MultiGrid2D::PrintAllGrids_v()
+{
+	int logfd = open("log/log_v.txt",O_RDWR|O_CREAT|O_TRUNC,S_IRWXU);
+
+	for(int i = 0; i < numGrids; i++)
+	{
+		printf("Grid: %d\n", i);
+		grids2D[i]->PrintGrid_v(logfd);
+	}
+
+	close(logfd);
+}
+
+void MultiGrid2D::PrintAllGrids_f()
+{
+	int logfd = open("log/log_f.txt",O_RDWR|O_CREAT|O_TRUNC,S_IRWXU);
+
+	for(int i = 0; i < numGrids; i++)
+	{
+		printf("Grid: %d\n", i);
+		grids2D[i]->PrintGrid_f(logfd);
+
+	}
+
+	close(logfd);
+}
+
+void MultiGrid2D::PrintMeanAbsoluteError()
+{
+	grids2D[0]->PrintMeanAbsoluteError();
+}
+
+/*********************************************************CUDA*********************************************************/
+
+//f_pitch e c_pitch NON vanno in byte
+
+__global__ void CUDARestrict(float* fine, int fsize, int f_pitch, float* coarse, int csize, int c_pitch)
+{
+	int c_iy = blockDim.y * blockIdx.y + threadIdx.y; //indice i
+	int c_ix = blockDim.x * blockIdx.x + threadIdx.x; //indice j
+	int c_idx = c_iy * c_pitch + c_ix; //indice elemento griglia rada (usare c_pitch!)
+
+	int f_iy = c_iy*2;
+	int f_ix = c_ix*2;
+	int f_idx = f_iy * f_pitch + f_ix; //indice elemento griglia fine (usare f_pitch!)
+
+	if(c_idx >= c_pitch*csize) //se questo indice è maggiore, allora lo è anche f_idx (DA VERIFICARE IL CONTROLLO!!!) 
+		return;
+
+	if(c_ix == 0 || c_ix == csize - 1 || c_iy == 0 || c_iy == csize - 1) //stiamo sui bordi
+	{		
+		coarse[c_idx] = fine[f_idx]; //copio semplicemente il valore da fine a coarse
+		return;
+	}
+
+	//else non stiamo sui bordi
+	f_idx = f_iy * f_pitch + f_ix; 
+	float C = fine[f_idx];
+
+	f_idx = (f_iy-1)*f_pitch + f_ix;
+	float N = fine[f_idx];
+
+	f_idx = (f_iy+1)*f_pitch + f_ix;
+	float S = fine[f_idx];
+
+	f_idx = f_iy*f_pitch + (f_ix+1);
+	float E = fine[f_idx];
+
+	f_idx = f_iy*f_pitch + (f_ix-1);
+	float O = fine[f_idx];
+
+	f_idx = (f_iy-1)*f_pitch + (f_ix+1);
+	float NE = fine[f_idx];
+
+	f_idx = (f_iy-1)*f_pitch + (f_ix-1);
+	float NO = fine[f_idx];
+
+	f_idx = (f_iy+1)*f_pitch + (f_ix+1);
+	float SE = fine[f_idx];
+
+	f_idx = (f_iy+1)*f_pitch + (f_ix-1);
+	float SO = fine[f_idx];
+
+	coarse[c_idx] = (1/16.0f)*(NO+NE+SO+SE + 2*(O+E+N+S) + 4*C);
+
+}
+
+//f_pitch e c_pitch NON vanno in byte
+//OK
+__global__ void CUDAInterpolate(float* fine, int fsize, int f_pitch, float* coarse, int csize, int c_pitch)
+{
+	int f_iy = blockDim.y * blockIdx.y + threadIdx.y; //indice i
+	int f_ix = blockDim.x * blockIdx.x + threadIdx.x; //indice j
+	int f_idx = f_iy * f_pitch + f_ix; //indice elemento griglia fine (usare f_pitch!)
+
+	int c_iy = f_iy/2; //divisione fra interi! 3/2=1
+	int c_ix = f_ix/2;
+	int c_idx = c_iy * c_pitch + c_ix; //indice elemento griglia rada (usare c_pitch!)
+
+	if(f_idx >= f_pitch*fsize) //(DA VERIFICARE IL CONTROLLO!!!) 
+		return;
+
+	if(f_ix == 0 || f_ix == fsize - 1 || f_iy == 0 || f_iy == fsize - 1) //i bordi non vanno modificati!
+		return; 
+
+	if(f_iy%2 == 0 && f_ix%2 == 0)
+		fine[f_idx] = coarse[c_idx];
+
+	if(f_iy%2 != 0 && f_ix%2 == 0)
+	{
+		c_idx = c_iy * c_pitch + c_ix;
+		float N = coarse[c_idx];
+		c_idx = (c_iy+1) * c_pitch + c_ix;
+		float S = coarse[c_idx];
+		fine[f_idx] = (1/2.0f)*(N + S);
+	}
+
+	if(f_iy%2 == 0 && f_ix%2 != 0)
+	{
+		c_idx = c_iy * c_pitch + c_ix;
+		float O = coarse[c_idx];
+		c_idx = c_iy * c_pitch + (c_ix+1);
+		float E = coarse[c_idx];
+		fine[f_idx] = (1/2.0f)*(O + E);
+	}
+
+	if(f_iy%2 != 0 && f_ix%2 != 0)
+	{
+		c_idx = c_iy * c_pitch + c_ix;
+		float NO = coarse[c_idx];
+		c_idx = (c_iy+1) * c_pitch + c_ix;
+		float SO = coarse[c_idx];
+		c_idx = c_iy * c_pitch + (c_ix+1);
+		float NE = coarse[c_idx];
+		c_idx = (c_iy+1) * c_pitch + (c_ix+1);
+		float SE = coarse[c_idx];
+		fine[f_idx] = (1/4.0f)*(NO + SO + NE + SE);
+	}
+
+}
+
+__global__ void CUDARelax(float* v, float* f, float h_x, float h_y, int size, int pitch, float x_a, float y_a, float* A, int alfa)
+{
+	int iy = blockDim.y * blockIdx.y + threadIdx.y; //indice i
+	int ix = blockDim.x * blockIdx.x + threadIdx.x; //indice j
+	int idx = iy * pitch + ix; //indice elemento griglia 
+
+	if(idx >= pitch*size) //(DA VERIFICARE IL CONTROLLO!!!) 
+		return;
+
+	if(ix == 0 || ix == size - 1 || iy == 0 || iy == size - 1) //i bordi non vanno modificati!
+		return;
+		
+	if((iy+ix)%2 == 0) //punti pari = punti rossi
+	{
+		float xj = x_a + ix*h_x;
+		float yi = y_a + iy*h_y;	
+		float K1 = A[0]*xj + A[1]*yi;
+		float K2 = A[2]*xj + A[3]*yi;
+		float den = K1*h_y+K2*h_x-alfa*h_x*h_y;			
+		
+		idx = iy * pitch + (ix+1);
+		float E = v[idx];
+		
+		idx = (iy+1) * pitch + ix;	
+		float S = v[idx];
+		
+		idx = iy * pitch + ix; //NECESSARIO RICALCOLARE INDICE!!! 		
+		
+		v[idx] = (h_y*K1*E + h_x*K2*S - 0)/(den); 
+	}
+
+	__syncthreads();//prima di aggiornare i punti neri(che dipendono esclusivamente da quelli rossi), bisogna aspettare che ogni punto rosso sia stato aggiornato 
+
+	if((iy+ix)%2 != 0) //punti dispari = punti neri
+	{
+		float xj = x_a + ix*h_x;
+		float yi = y_a + iy*h_y;	
+		float K1 = A[0]*xj + A[1]*yi;
+		float K2 = A[2]*xj + A[3]*yi;
+		float den = K1*h_y+K2*h_x-alfa*h_x*h_y;			
+		
+		idx = iy * pitch + (ix+1);
+		float E = v[idx];
+
+		idx = (iy+1) * pitch + ix;	
+		float S = v[idx];
+
+		idx = iy * pitch + ix; //NECESSARIO RICALCOLARE INDICE!!! 		
+
+		v[idx] = (h_y*K1*E + h_x*K2*S - 0)/(den); 
+	}
+}
+//OCCHIOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO
+__global__ void CUDASet(float* v, int size, int pitch, float value, bool modifyBorder)
+{
+	int iy = blockDim.y * blockIdx.y + threadIdx.y; //indice i
+	int ix = blockDim.x * blockIdx.x + threadIdx.x; //indice j
+	int idx = iy * pitch + ix; //indice elemento griglia 
+
+	if(idx >= pitch*size)
+		return;
+
+	if(!modifyBorder) //non devo modificare i bordi
+		if(ix == 0 || ix == size - 1 || iy == 0 || iy == size - 1)		
+			return;	
+	//else
+	v[idx] = value;
+}
+
+__global__ void CUDACalculateResidual(float* v, float* f, float* residual, float h_x, float h_y, int size, int pitch, float x_a, float y_a, float* A, int alfa)
+{
+	int iy = blockDim.y * blockIdx.y + threadIdx.y; //indice i
+	int ix = blockDim.x * blockIdx.x + threadIdx.x; //indice j
+	int idx = iy * pitch + ix; //indice elemento griglia 
+
+	if(idx >= pitch*size)
+		return;
+
+	if(ix == 0 || ix == size - 1 || iy == 0 || iy == size - 1) //residuo sui bordi
+	{
+		residual[idx] = 0.0; //residui sui bordi nullo
+		return;
+	}
+	
+	//else
+	float xj = x_a + ix*h_x;
+	float yi = y_a + iy*h_y;	
+	float K1 = A[0]*xj + A[1]*yi;
+	float K2 = A[2]*xj + A[3]*yi;			
+	
+	idx = iy * pitch + (ix+1);
+	float E = v[idx]; //variazione lungo le x
+	
+	idx = (iy+1) * pitch + ix;	
+	float S = v[idx]; //variazione lungo le y
+	
+	idx = iy * pitch + ix; //NECESSARIO RICALCOLARE INDICE!!! 		
+
+	residual[idx] = f[idx] - (h_y*K1*E + h_x*K2*S - v[idx]*(h_y*K1+h_x*K2-alfa*h_x*h_y))/(h_x*h_y);
+}
+                                   
+__global__ void CUDAApplyCorrection(float* fine, float* error, int size, int pitch)
+{
+	int iy = blockDim.y * blockIdx.y + threadIdx.y; //indice i
+	int ix = blockDim.x * blockIdx.x + threadIdx.x; //indice j
+	int idx = iy * pitch + ix; //indice elemento griglia 
+
+	if(idx >= pitch*size)
+		return;
+
+	if(ix == 0 || ix == size - 1 || iy == 0 || iy == size - 1) //i bordi non vanno modificati! Lì la soluzione è già quella reale
+		return;
+	
+	fine[idx] = fine[idx] + error[idx]; //u = v + e (u potrebbe essere usato come errore nella griglia un pò più fine)	
+}
+

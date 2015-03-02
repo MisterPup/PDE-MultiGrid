@@ -1,0 +1,4 @@
+g++ -c Grid2D.cpp
+g++ -c MultiGrid2D.cpp
+g++ -c LyapunovSolver.cpp
+g++ Grid2D.o MultiGrid2D.o LyapunovSolver.o -o Lyapunov

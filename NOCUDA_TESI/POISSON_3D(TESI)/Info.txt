@@ -1,0 +1,10 @@
+Aumentando il range (l'intervallo in cui effettuare il calcolo della soluzione) è necessario aumentare anche
+il numero di punti per griglia e di conseguenza anche il numero di iterazioni di rilassamento
+
+Equazione risolta, Poisson 3D:
+
+delta^2 u = f(x,y,z)
+
+dove f = -3*PI*PI*sin(PI*x)*sin(PI*y)*sin(PI*z);
+
+La soluzione reale (nota) è pari a u =  sin(PI*x)*sin(PI*y)*sin(PI*z);

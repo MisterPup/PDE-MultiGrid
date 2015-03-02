@@ -1,0 +1,25 @@
+
+     2    -2
+P = 
+    -2     2 
+    
+--------------------------
+ 
+    -1    -2
+A = 
+     0    -3
+--------------------------  
+
+Se modifichi i parametri di A cambia anche l'equazione, devi ricalcolarla!
+Ai fini della pde non cambia niente se P sia > 0 o no (ma ovviamente non è funzione
+candidata di lyapunov)
+Probabilmente non cambia neanche nel caso in cui A non sia di Horwitz<--da testare
+
+Se aumenti il range (cioè non più fra 0 e 1 ma magari fra 5 e 50, devi aumentare 
+anche il numero di punti nella griglia, altrimenti il risultato viene errato di 
+molto)
+
++ range + punti + relax
+
+devo scegliere A e range tali che: (a11+a21)xi+(a12+a22)yj-h*alfa!=0 (CREDO SIA AUTOMATICO)
+     

@@ -1,0 +1,19 @@
+Se aumenti il range (cioè non più fra 0 e 1 ma magari fra 5 e 50, devi aumentare 
+anche il numero di punti nella griglia, altrimenti il risultato viene errato di 
+molto)
+Se aumenti i punti proba
+
++ range + punti + relax
+
+
+risolve poisson:
+
+delta2 u = f(x,y,z)
+
+dove f = -3*PI*PI*sin(PI*x)*sin(PI*y)*sin(PI*z);
+
+e la sol real u =  sin(PI*x)*sin(PI*y)*sin(PI*z);
+
+
+
+occhio per relax, settovalue, apply correction, compute residual

@@ -1,0 +1,4 @@
+nvcc -c Grid1D.cu
+nvcc -c MultiGrid1D.cu
+nvcc -c main.cu
+nvcc Grid1D.o MultiGrid1D.o main.o -o CUDA
